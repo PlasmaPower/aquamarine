@@ -446,8 +446,8 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
             }
 
             if (!drmFB) {
-                backend->log(AQ_LOG_DEBUG, std::format("drm: Buffer unavailable for crtc {} restore ({}), requesting re-render",
-                                                       c->crtc->id, shouldBlit() ? "multi-gpu" : "import failed"));
+                backend->log(AQ_LOG_DEBUG,
+                             std::format("drm: Buffer unavailable for crtc {} restore ({}), requesting re-render", c->crtc->id, shouldBlit() ? "multi-gpu" : "import failed"));
                 noMode.emplace_back(c);
                 continue;
             }
@@ -747,8 +747,8 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
     }
 
     for (size_t i = 0; i < crtcs.size(); ++i) {
-        const auto& crtc = crtcs.at(i);
-        bool taken = false;
+        const auto& crtc  = crtcs.at(i);
+        bool        taken = false;
         for (auto const& c : connectors) {
             if (c->crtc != crtc)
                 continue;
@@ -1765,8 +1765,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
 void Aquamarine::SDRMConnector::disconnect() {
     if (!output) {
         if (backend && backend->backend)
-            backend->backend->log(AQ_LOG_DEBUG,
-                std::format("drm: Not disconnecting connector {} because it's already disconnected", szName));
+            backend->backend->log(AQ_LOG_DEBUG, std::format("drm: Not disconnecting connector {} because it's already disconnected", szName));
         return;
     }
 
@@ -1990,8 +1989,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                 // page-flip at the kernel level. Clear the stale userspace
                 // bookkeeping to match.
                 backend->backend->log(AQ_LOG_DEBUG,
-                                      std::format("drm: Clearing stale page-flip state for {} during modeset (pending for {}ms)", name,
-                                                  nowMs - connector->pageFlipPendingAtMs));
+                                      std::format("drm: Clearing stale page-flip state for {} during modeset (pending for {}ms)", name, nowMs - connector->pageFlipPendingAtMs));
                 connector->isPageFlipPending   = false;
                 connector->isFrameRunning      = false;
                 connector->frameEventScheduled = false;

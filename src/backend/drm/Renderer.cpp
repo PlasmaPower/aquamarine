@@ -1,4 +1,5 @@
 #include "Renderer.hpp"
+#include "../../allocator/UDMABuf.hpp"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <algorithm>
@@ -414,7 +415,6 @@ void CDRMRenderer::loadEGLAPI() {
     loadGLProc(&proc.eglWaitSyncKHR, "eglWaitSyncKHR");
     loadGLProc(&proc.eglCreateSyncKHR, "eglCreateSyncKHR");
     loadGLProc(&proc.eglDupNativeFenceFDANDROID, "eglDupNativeFenceFDANDROID");
-    loadGLProc(&proc.glReadnPixelsEXT, "glReadnPixelsEXT");
 
     if (EGLEXTENSIONS.contains("EGL_EXT_device_base") || EGLEXTENSIONS.contains("EGL_EXT_device_enumeration"))
         loadGLProc(&proc.eglQueryDevicesEXT, "eglQueryDevicesEXT");
@@ -768,45 +768,6 @@ CGLTex CDRMRenderer::glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buffa) {
     return tex;
 }
 
-constexpr GLenum PIXEL_BUFFER_FORMAT = GL_RGBA;
-
-void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
-    CEglContextGuard eglContext(*this);
-    auto             att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
-    if (!att || att->renderer != self) {
-        att = makeShared<CDRMRendererBufferOutputAttachment>(self, nullptr, 0, 0);
-        buf->attachments.add(att);
-    }
-
-    const auto& dma = buf->dmabuf();
-    if (!att->eglImage) {
-        att->eglImage = createEGLImage(dma);
-        if (att->eglImage == EGL_NO_IMAGE_KHR) {
-            backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): createEGLImage failed: {}", eglGetError()));
-            return;
-        }
-
-        GLCALL(glGenRenderbuffers(1, &att->rbo));
-        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, att->rbo));
-        GLCALL(proc.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, (GLeglImageOES)att->eglImage));
-        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));
-
-        GLCALL(glGenFramebuffers(1, &att->fbo));
-        GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
-        GLCALL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, att->rbo));
-
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): glCheckFramebufferStatus failed: {}", glGetError()));
-            return;
-        }
-    }
-
-    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
-    GLCALL(proc.glReadnPixelsEXT(0, 0, dma.size.x, dma.size.y, GL_RGBA, GL_UNSIGNED_BYTE, out.size(), out.data()));
-
-    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
-}
-
 void CDRMRenderer::waitOnSync(int fd) {
     TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (waitOnSync): attempting to wait on fd {}", fd)));
 
@@ -934,49 +895,94 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
         return {};
     }
 
-    if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD)) {
-        // wait on a provided explicit fence
-        waitOnSync(waitFD);
-    }
+    // Acquire a texture for sampling `from`. Three paths, in priority order:
+    //   1. Mirror attachment cached on `from` (fallback path from a prior blit): use it.
+    //   2. InputAttachment cached on `from`: use its direct-import EGLImage tex.
+    //   3. No cache: try to import `from`'s dmabuf directly (InputAttachment); if that fails and
+    //      we have a primary renderer, fall back to a host-memory intermediate (MirrorAttachment).
+    //
+    // In the fallback path, the primary renders `from` into the intermediate via a recursive
+    // primary->blit, and the primary's output fence becomes our wait fence (waitFD is passed
+    // down). The double FLIPPED_180 (primary's + ours) collapses to identity orientation.
+    //
+    // We hold strong refs to the attachments across the recursive primary->blit call so that the
+    // primary writing its own InputAttachment onto `from` cannot drop our cached tex out from
+    // under fromTex.
 
-    // firstly, get a texture from the from buffer
-    // if it has an attachment, use that
-    // both from and to have the same AQ_ATTACHMENT_DRM_RENDERER_DATA.
-    // Those buffers always come from different swapchains, so it's OK.
-
-    WP<CGLTex>         fromTex;
-    const auto&        fromDma = from->dmabuf();
-    std::span<uint8_t> intermediateBuf;
+    WP<CGLTex>                             fromTex;
+    SP<CDRMRendererBufferMirrorAttachment> mirrorAtt;
+    SP<CDRMRendererBufferInputAttachment>  inputAtt;
+    bool                                   waitFDConsumed = false;
+    const auto&                            fromDma        = from->dmabuf();
     {
-        auto attachment = from->attachments.get<CDRMRendererBufferInputAttachment>();
-        if (attachment && attachment->renderer == self) {
-            TRACE(backend->log(AQ_LOG_TRACE, "EGL (blit): From attachment found"));
-            fromTex         = attachment->tex;
-            intermediateBuf = attachment->intermediateBuf;
+        mirrorAtt = from->attachments.get<CDRMRendererBufferMirrorAttachment>();
+        if (mirrorAtt && mirrorAtt->renderer == self && mirrorAtt->tex && mirrorAtt->tex->image) {
+            TRACE(backend->log(AQ_LOG_TRACE, "EGL (blit): Mirror attachment found"));
+            fromTex = mirrorAtt->tex;
+        } else {
+            mirrorAtt.reset();
+
+            inputAtt = from->attachments.get<CDRMRendererBufferInputAttachment>();
+            if (inputAtt && inputAtt->renderer == self && inputAtt->tex && inputAtt->tex->image) {
+                TRACE(backend->log(AQ_LOG_TRACE, "EGL (blit): From attachment found"));
+                fromTex = inputAtt->tex;
+            } else {
+                inputAtt.reset();
+
+                backend->log(AQ_LOG_DEBUG, "EGL (blit): No attachment in from, creating a new image");
+                auto newInput = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from));
+                if (newInput->tex && newInput->tex->image) {
+                    from->attachments.add(newInput);
+                    inputAtt = newInput;
+                    fromTex  = inputAtt->tex;
+                } else if (primaryRenderer) {
+                    backend->log(AQ_LOG_DEBUG, "EGL (blit): Failed to create image from source buffer directly, allocating host-memory intermediate");
+
+                    // udmabuf-backed: a GPU-agnostic host-memory dma-buf, so both renderers can
+                    // import it as an EGLImage even on GPUs (e.g. NVIDIA) that refuse imports
+                    // tagged as coming from another DRM device's PRIME export.
+                    auto interBuf = CUDMABuf::create(fromDma.size, DRM_FORMAT_ABGR8888);
+                    if (!interBuf) {
+                        backend->log(AQ_LOG_ERROR, "EGL (blit): failed to allocate host-memory intermediate (is /dev/udmabuf available?)");
+                        return {};
+                    }
+
+                    auto interTex = glTex(interBuf);
+                    if (!interTex.image) {
+                        backend->log(AQ_LOG_ERROR, "EGL (blit): failed to import host-memory intermediate on secondary");
+                        return {};
+                    }
+
+                    mirrorAtt = makeShared<CDRMRendererBufferMirrorAttachment>(self, interBuf, std::move(interTex));
+                    from->attachments.add(mirrorAtt);
+                    fromTex = mirrorAtt->tex;
+                } else {
+                    backend->log(AQ_LOG_ERROR, "EGL (blit): could not import source and no primary renderer available for fallback");
+                    return {};
+                }
+            }
         }
 
-        if ((!fromTex || !fromTex->image) && intermediateBuf.empty()) {
-            backend->log(AQ_LOG_DEBUG, "EGL (blit): No attachment in from, creating a new image");
-
-            attachment = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from), std::vector<uint8_t>());
-            from->attachments.add(attachment);
-
-            if (!attachment->tex->image && primaryRenderer) {
-                backend->log(AQ_LOG_DEBUG, "EGL (blit): Failed to create image from source buffer directly, allocating intermediate buffer");
-                static_assert(PIXEL_BUFFER_FORMAT == GL_RGBA); // If the pixel buffer format changes, the below size calculation probably needs to as well.
-                attachment->intermediateBuf.resize(fromDma.size.x * fromDma.size.y * 4);
-                intermediateBuf         = attachment->intermediateBuf;
-                attachment->tex->target = GL_TEXTURE_2D;
-                GLCALL(glGenTextures(1, &attachment->tex->texid));
+        if (mirrorAtt) {
+            // Cross-GPU fallback: have the primary render `from` into the host-memory intermediate
+            // and gate our sampling on its output fence. The primary consumes waitFD as its input
+            // fence; its returned FD is owned by primary's recreateBlitSync slot (don't close).
+            auto primaryResult = primaryRenderer->blit(from, mirrorAtt->intermediate, nullptr, waitFD);
+            if (!primaryResult.success) {
+                backend->log(AQ_LOG_ERROR, "EGL (blit): primary failed to render source into intermediate");
+                return {};
             }
 
-            fromTex = attachment->tex;
-        }
+            if (primaryResult.syncFD.has_value())
+                waitOnSync(primaryResult.syncFD.value());
 
-        if (!intermediateBuf.empty() && primaryRenderer) {
-            // Note: this might modify from's output attachment
-            primaryRenderer->readBuffer(from, intermediateBuf);
+            waitFDConsumed = true;
         }
+    }
+
+    if (!waitFDConsumed && waitFD >= 0 && !CFileDescriptor::isReadable(waitFD)) {
+        // wait on a provided explicit fence
+        waitOnSync(waitFD);
     }
 
     TRACE(backend->log(AQ_LOG_TRACE,
@@ -1071,9 +1077,6 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     GLCALL(fromTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST));
     GLCALL(fromTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST));
 
-    if (!intermediateBuf.empty())
-        GLCALL(glTexImage2D(fromTex->target, 0, PIXEL_BUFFER_FORMAT, fromDma.size.x, fromDma.size.y, 0, PIXEL_BUFFER_FORMAT, GL_UNSIGNED_BYTE, intermediateBuf.data()));
-
     useProgram(SHADER.program);
     GLCALL(glDisable(GL_BLEND));
     GLCALL(glDisable(GL_SCISSOR_TEST));
@@ -1108,7 +1111,7 @@ bool CDRMRenderer::verifyDestinationDMABUF(const SDMABUFAttrs& attrs) {
         if (fmt.modifier != attrs.modifier)
             continue;
 
-        if (fmt.modifier != DRM_FORMAT_INVALID && fmt.external) {
+        if (fmt.modifier != DRM_FORMAT_MOD_INVALID && fmt.external) {
             backend->log(AQ_LOG_ERROR, "EGL (verifyDestinationDMABUF): FAIL, format is external-only");
             return false;
         }
@@ -1155,9 +1158,8 @@ void CGLTex::setTexParameter(GLenum pname, GLint param) {
     glTexParameteri(target, pname, param);
 }
 
-CDRMRendererBufferInputAttachment::CDRMRendererBufferInputAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_, CGLTex&& tex_,
-                                                                     std::vector<uint8_t> intermediateBuf_) :
-    tex(makeUnique<CGLTex>(std::move(tex_))), intermediateBuf(intermediateBuf_), renderer(renderer_) {}
+CDRMRendererBufferInputAttachment::CDRMRendererBufferInputAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_, CGLTex&& tex_) :
+    tex(makeUnique<CGLTex>(std::move(tex_))), renderer(renderer_) {}
 
 CDRMRendererBufferInputAttachment::~CDRMRendererBufferInputAttachment() {
     if (renderer.expired())
@@ -1167,6 +1169,25 @@ CDRMRendererBufferInputAttachment::~CDRMRendererBufferInputAttachment() {
     CEglContextGuard eglContext(*renderer);
 
     TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (~CDRMRendererBufferInputAttachment): dropping tex {}", tex ? (int)tex->texid : -1)));
+
+    if (tex && tex->texid)
+        GLCALL(glDeleteTextures(1, &tex->texid));
+    if (tex && tex->image)
+        renderer->proc.eglDestroyImageKHR(renderer->egl.display, tex->image);
+}
+
+CDRMRendererBufferMirrorAttachment::CDRMRendererBufferMirrorAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_,
+                                                                       Hyprutils::Memory::CSharedPointer<IBuffer> intermediate_, CGLTex&& tex_) :
+    intermediate(intermediate_), tex(makeUnique<CGLTex>(std::move(tex_))), renderer(renderer_) {}
+
+CDRMRendererBufferMirrorAttachment::~CDRMRendererBufferMirrorAttachment() {
+    if (renderer.expired())
+        return;
+
+    auto&            backend = renderer->backend;
+    CEglContextGuard eglContext(*renderer);
+
+    TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (~CDRMRendererBufferMirrorAttachment): dropping tex {}", tex ? (int)tex->texid : -1)));
 
     if (tex && tex->texid)
         GLCALL(glDeleteTextures(1, &tex->texid));

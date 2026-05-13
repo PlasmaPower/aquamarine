@@ -12,7 +12,6 @@
 #include <optional>
 #include <tuple>
 #include <vector>
-#include <span>
 
 namespace Aquamarine {
 
@@ -43,11 +42,27 @@ namespace Aquamarine {
 
     class CDRMRendererBufferInputAttachment : public IAttachment {
       public:
-        CDRMRendererBufferInputAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_, CGLTex&& tex, std::vector<uint8_t> intermediateBuf_);
+        CDRMRendererBufferInputAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_, CGLTex&& tex);
         virtual ~CDRMRendererBufferInputAttachment();
 
+        // EGLImage texture wrapping the buffer's dmabuf directly, for sampling.
         Hyprutils::Memory::CUniquePointer<CGLTex>     tex;
-        std::vector<uint8_t>                          intermediateBuf;
+
+        Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer;
+    };
+
+    // Used in the secondary-GPU fallback blit path when the secondary cannot import `from`'s
+    // dmabuf directly (e.g. NVIDIA without P2P). Holds a host-memory intermediate buffer and the
+    // secondary's EGLImage texture wrapping that intermediate's dmabuf. Kept as a separate type
+    // from CDRMRendererBufferInputAttachment so that the primary's recursive blit into the
+    // intermediate (which attaches an InputAttachment to `from`) does not clobber this cache.
+    class CDRMRendererBufferMirrorAttachment : public IAttachment {
+      public:
+        CDRMRendererBufferMirrorAttachment(Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer_, Hyprutils::Memory::CSharedPointer<IBuffer> intermediate_, CGLTex&& tex);
+        virtual ~CDRMRendererBufferMirrorAttachment();
+
+        Hyprutils::Memory::CSharedPointer<IBuffer>    intermediate;
+        Hyprutils::Memory::CUniquePointer<CGLTex>     tex;
 
         Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer;
     };
@@ -130,7 +145,6 @@ namespace Aquamarine {
             PFNEGLDEBUGMESSAGECONTROLKHRPROC              eglDebugMessageControlKHR              = nullptr;
             PFNEGLQUERYDEVICESEXTPROC                     eglQueryDevicesEXT                     = nullptr;
             PFNEGLQUERYDEVICESTRINGEXTPROC                eglQueryDeviceStringEXT                = nullptr;
-            PFNGLREADNPIXELSEXTPROC                       glReadnPixelsEXT                       = nullptr;
         } proc;
 
         struct {
@@ -154,7 +168,6 @@ namespace Aquamarine {
         } egl;
 
         CGLTex                                        glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
-        void                                          readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out);
 
         Hyprutils::Memory::CWeakPointer<CDRMRenderer> self;
         std::vector<SGLFormat>                        formats;
@@ -181,6 +194,7 @@ namespace Aquamarine {
 
         friend class CEglContextGuard;
         friend class CDRMRendererBufferInputAttachment;
+        friend class CDRMRendererBufferMirrorAttachment;
         friend class CDRMRendererBufferOutputAttachment;
     };
 };
